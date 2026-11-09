@@ -1,19 +1,21 @@
 // ============================================
 // ONE BEHAVIOUR: proximity stretch
 // 规则：每个格子的尺寸 = f(指针到它的距离)
-// + ml5 0.12.2 声音分类驱动 RULES（Clap / Voice / Tap / Background）
+// + ml5 0.12.2 声音分类：驱动 RULES（尺寸/衰减）与颜色
+// + 麦克风由玩家手动开启（按 M），避免浏览器自动拦截
 // ============================================
 
 // ---------- 声音模型配置 ----------
 // Teachable Machine 模型（Audio Project）
 // 类别由模型自带的 metadata.json -> wordLabels 决定，代码里不用写死；
 // 启动后控制台会打印一次实际拿到的类别列表，方便确认模型是否已更新。
-// 早期版本只有 ["Background Noise", "Clap", "Voice"] 三类，此时 Tap 不会触发。
 const MODEL_URL = 'https://teachablemachine.withgoogle.com/models/gPa2FZdHa/model.json';
 
-const THRESHOLD = 0.85;      // 置信度门槛：低于它 → 中性类，不接管 RULES
+const THRESHOLD = 0.85;      // 置信度门槛：低于它 → 中性类，不接管 RULES / 不染色
 const SOUND_SMOOTH = 0.06;   // 声音规则对 RULES 的平滑速度（0~1，越大越跟手）
-const PANEL_W = 300;         // HUD 面板宽度（加了 label/confidence 后需要宽一点）
+const COLOR_SMOOTH = 0.08;   // 颜色过渡速度（0~1），避免类别切换时闪色
+const COLOR_REACH = 0.6;     // 类别色向外的铺开程度：越大颜色越往外渗（0.3~1）
+const PANEL_W = 320;         // HUD 面板宽度
 
 // 声音类别 -> RULES 目标值
 // radius：影响半径越大，波纹铺得越开
@@ -26,8 +28,14 @@ const LABEL_MAP = {
   Background: { radius: 260, maxStretch: 2.20, ease: 2.00 }   // 背景：回到默认呼吸状态
 };
 
+// 声音类别 -> 颜色（HSB）。Background 不给颜色 = 保留原版冷暖渐变
+const PALETTES = {
+  clap:  { h: 15,  s: 90, b: 100 },   // 橙红
+  voice: { h: 280, s: 80, b: 100 },   // 紫
+  tap:   { h: 140, s: 80, b: 100 }    // 绿
+};
+
 // 常见别名 / 中文标签归一化（Teachable Machine 里标签随手写也能认）
-// 本模型用的是 "Background Noise"，所以这里显式收了带空格的写法
 const LABEL_ALIASES = {
   clap: 'Clap', clapping: 'Clap', 拍手: 'Clap', 拍掌: 'Clap',
   voice: 'Voice', speech: 'Voice', talking: 'Voice', 人声: 'Voice', 说话: 'Voice', 语音: 'Voice',
@@ -54,19 +62,22 @@ let showHUD = true;
 // ---------- 声音状态 ----------
 let classifier = null;       // ml5 分类器
 let modelReady = false;
-let classifying = false;
+let micOn = false;           // 麦克风是否已由用户开启（按 M）
+let classifying = false;     // 防止重复注册回调
 let listenError = '';
 
-let soundEnabled = true;     // 'm' 键开关：关掉后只用鼠标/键盘
 let soundTarget = null;      // 当前生效的 RULES 目标（null = 中性，保持现状）
-let soundClass = '';         // 归一化后的类别名
+let soundClass = '';         // 归一化后的类别名（小写）
 
 let lastLabel = '—';         // 原始 label（HUD 显示）
 let lastConfidence = 0;      // 原始置信度 0~1
 let labelsLogged = false;    // 类别清单只在首帧打印一次
 
+// 类别色状态：w 是「类别色权重」，0 = 完全用原版渐变
+let palette = { h: 25, s: 78, b: 96, w: 0 };
+
 // ============================================
-// preload：加载 Teachable Machine 模型
+// preload：加载 Teachable Machine 模型（只加载模型，不碰麦克风）
 // ============================================
 function preload() {
   if (!MODEL_URL) {
@@ -85,28 +96,55 @@ function preload() {
 
 function onModelReady() {
   modelReady = true;
-  console.log('[sound] 模型加载完成，开始监听。');
-  startClassify();
+  console.log('[sound] 模型加载完成。按 M 开启麦克风。');
+  // 若用户在模型还没加载完时就按了 M，这里补上启动
+  if (micOn) startClassify();
 }
 
 function startClassify() {
   if (!modelReady || classifying || !classifier) return;
-  classifying = true;
-  classifier.classify(gotResult);
+  try {
+    classifying = true;
+    classifier.classify(gotResult);   // 这一步才会请求麦克风权限
+    console.log('[sound] 麦克风已开启，开始分类。');
+  } catch (e) {
+    classifying = false;
+    micOn = false;
+    listenError = 'MIC 打不开';
+    console.error('[sound] 开启麦克风失败：', e);
+  }
+}
+
+// M 键：手动开/关麦克风
+function toggleMic() {
+  if (micOn) {
+    micOn = false;
+    setNeutral('—', 0);
+    console.log('[sound] 麦克风已关闭（分类流仍在，但结果被忽略）。');
+    return;
+  }
+
+  if (!MODEL_URL) { listenError = 'URL 未填写'; return; }
+  if (typeof ml5 === 'undefined') { listenError = 'ml5 未加载'; return; }
+
+  micOn = true;
+  if (modelReady) startClassify();   // 模型没就绪时，onModelReady 会补启动
 }
 
 // ============================================
 // gotResult：ml5 持续回调（约每秒数十次）
 // ============================================
 function gotResult(error, results) {
+  if (!micOn) return;   // 手动关闭后，忽略一切结果
+
   if (error) {
-    listenError = String(error).slice(0, 26);
+    listenError = String(error).slice(0, 24);
     console.error('[sound] classify error:', error);
     return;
   }
   listenError = '';
 
-  // 没有结果（模型刚启动 / 麦克风串流还没就绪）
+  // 没有结果（麦克风串流还没就绪）
   if (!results || results.length === 0) {
     setNeutral('—', 0);
     return;
@@ -128,7 +166,7 @@ function gotResult(error, results) {
   }
 
   // 中性类处理：
-  // 1) 置信度不到 THRESHOLD —— 不可信，不改变 RULES
+  // 1) 置信度不到 THRESHOLD —— 不可信，不改变 RULES / 颜色
   // 2) 标签不在映射表里 —— 未知类，同样当中性
   const mapped = normalizeLabel(top.label);
 
@@ -158,7 +196,7 @@ function normalizeLabel(raw) {
   return null;
 }
 
-// 中性：清空目标，RULES 保持现状（不强行拉回默认值，避免来回抖动）
+// 中性：清空目标，RULES 与颜色都保持现状（不强行重置，避免抖动）
 function setNeutral(label, confidence) {
   soundClass = '';
   soundTarget = null;
@@ -168,7 +206,7 @@ function setNeutral(label, confidence) {
   }
 }
 
-// 命中即切换目标；真正的「缓过来」交给 applySoundRules 的 lerp 完成
+// 命中即切换目标；真正的「缓过来」交给 applySoundRules / updatePalette 的 lerp 完成
 function commitRule(cls) {
   soundClass = cls;
   soundTarget = LABEL_MAP[capitalize(cls)] || null;
@@ -182,7 +220,7 @@ function capitalize(s) {
 // applySoundRules：把声音目标平滑地推到 RULES 上
 // ============================================
 function applySoundRules() {
-  if (!soundEnabled || !soundTarget) return;
+  if (!micOn || !soundTarget) return;
 
   RULES.radius = lerp(RULES.radius, soundTarget.radius, SOUND_SMOOTH);
   RULES.maxStretch = lerp(RULES.maxStretch, soundTarget.maxStretch, SOUND_SMOOTH);
@@ -195,6 +233,28 @@ function applySoundRules() {
 }
 
 // ============================================
+// updatePalette：类别色的平滑过渡
+// 目标色存在时 w -> 1，不存在（Background / 中性 / 关麦）时 w -> 0
+// ============================================
+function updatePalette() {
+  const target = (micOn && soundTarget && PALETTES[soundClass]) ? PALETTES[soundClass] : null;
+
+  palette.w = lerp(palette.w, target ? 1 : 0, COLOR_SMOOTH);
+
+  if (target) {
+    palette.h = lerpHue(palette.h, target.h, COLOR_SMOOTH);
+    palette.s = lerp(palette.s, target.s, COLOR_SMOOTH);
+    palette.b = lerp(palette.b, target.b, COLOR_SMOOTH);
+  }
+}
+
+// 色相插值走最短弧，避免 350 -> 10 时绕一大圈
+function lerpHue(a, b, t) {
+  const diff = ((b - a + 540) % 360) - 180;
+  return (a + diff * t + 360) % 360;
+}
+
+// ============================================
 // p5 生命周期
 // ============================================
 function setup() {
@@ -202,9 +262,7 @@ function setup() {
   noStroke();
   colorMode(HSB, 360, 100, 100, 100);
   buildGrid();
-
-  // 若 preload 阶段没走到回调，这里补一次启动
-  if (modelReady) startClassify();
+  // 注意：这里不再自动开麦，等用户按 M
 }
 
 function windowResized() {
@@ -233,10 +291,12 @@ function buildGrid() {
 function draw() {
   background(220, 8, 12);
 
-  // 声音规则先作用于 RULES，再用这一帧的 RULES 去画
+  // 声音规则 / 颜色先推进一帧，再用这一帧的状态去画
   applySoundRules();
+  updatePalette();
 
   const s = RULES.cellSize;
+  const usePalette = palette.w > 0.004;   // 权重极小就跳过染色计算
 
   for (const cell of cells) {
     // 1. 测量：指针到格子中心的距离
@@ -259,9 +319,22 @@ function draw() {
     cell.w = lerp(cell.w, tw, RULES.smooth);
     cell.h = lerp(cell.h, th, RULES.smooth);
 
-    // 5. 可视化：距离同时驱动色相（近暖远冷）
+    // 5. 可视化：距离驱动色相（近暖远冷）—— 这是「无声音」时的基线色
     const nd = constrain(d, 0, RULES.radius) / RULES.radius;
-    fill(lerp(25, 205, nd), lerp(78, 45, nd), lerp(96, 82, nd), 90);
+    let hh = lerp(25, 205, nd);
+    let ss = lerp(78, 45, nd);
+    let bb = lerp(96, 82, nd);
+
+    // 5b. 有声音类别时：受影响区域（t > 0）按类别染色
+    //     混合量 = 类别权重 × 强度（用 COLOR_REACH 压平曲线，让颜色往外渗得更自然）
+    if (usePalette && t > 0) {
+      const m = palette.w * constrain(pow(t, COLOR_REACH), 0, 1);
+      hh = lerpHue(hh, palette.h, m);
+      ss = lerp(ss, palette.s, m);
+      bb = lerp(bb, palette.b, m);
+    }
+
+    fill(hh, ss, bb, 90);
 
     // 6. 绘制：以格子中心为锚点向外扩张
     const ox = (cell.w - s) / 2;
@@ -272,48 +345,80 @@ function draw() {
   if (showHUD) drawHUD();
 }
 
+// ============================================
+// HUD：参数 / 麦克风状态 / label+confidence / 声音-视觉映射表
+// ============================================
 function drawHUD() {
-  // 声音状态文案
-  let audioLine;
-  if (!MODEL_URL)         audioLine = 'sound   URL 未填写';
-  else if (listenError)   audioLine = 'sound   ' + listenError;
-  else if (!modelReady)   audioLine = 'sound   模型加载中…';
-  else if (!soundEnabled) audioLine = 'sound   已静音 (m)';
-  else if (soundTarget)   audioLine = 'sound   ' + soundClass + ' 接管中';
-  else                    audioLine = 'sound   中性 / 保持现状';
+  // 一行一个样式：t=文本, c=颜色主题, sz=字号
+  const rows = [];
 
-  const lines = [
-    'radius      ' + RULES.radius.toFixed(0) + '   ↑ ↓',
-    'maxStretch  ' + RULES.maxStretch.toFixed(2) + '   ← →',
-    'ease        ' + RULES.ease.toFixed(2) + '   [ ]',
-    'cellSize    ' + RULES.cellSize.toFixed(0) + '   - +',
-    'smooth      ' + RULES.smooth.toFixed(2) + '   z x',
-    '',
-    audioLine,
-    'label       ' + lastLabel + '   (阈值 ' + THRESHOLD.toFixed(2) + ')',
-    'confidence  ' + (lastConfidence * 100).toFixed(1) + '%',
-    '',
-    'H 隐藏 / R 重置 / M 声音开关'
-  ];
+  rows.push({ t: 'radius      ' + RULES.radius.toFixed(0) + '   ↑ ↓' });
+  rows.push({ t: 'maxStretch  ' + RULES.maxStretch.toFixed(2) + '   ← →' });
+  rows.push({ t: 'ease        ' + RULES.ease.toFixed(2) + '   [ ]' });
+  rows.push({ t: 'cellSize    ' + RULES.cellSize.toFixed(0) + '   - +' });
+  rows.push({ t: 'smooth      ' + RULES.smooth.toFixed(2) + '   z x' });
+  rows.push({ t: '' });
+
+  // 麦克风状态：关着就醒目提示，开着显示当前状态
+  if (!MODEL_URL) {
+    rows.push({ t: 'MODEL_URL 未填写，无法开麦', c: 'alert', sz: 13 });
+  } else if (!micOn) {
+    rows.push({ t: "Press 'M' to enable Microphone.", c: 'alert', sz: 13 });
+  } else if (!modelReady) {
+    rows.push({ t: '● MIC ON   model loading…', c: 'ok' });
+  } else if (listenError) {
+    rows.push({ t: '● MIC ON   ' + listenError, c: 'alert' });
+  } else if (soundTarget) {
+    rows.push({ t: '● MIC ON   ' + capitalize(soundClass) + ' driving', c: 'ok' });
+  } else {
+    rows.push({ t: '● MIC ON   neutral / holding', c: 'ok' });
+  }
+
+  rows.push({ t: '' });
+  rows.push({ t: 'label       ' + lastLabel });
+  rows.push({ t: 'confidence  ' + (lastConfidence * 100).toFixed(1) + '%   (阈值 ' + THRESHOLD.toFixed(2) + ')' });
+  rows.push({ t: '' });
+
+  // 映射表：给老师看「声音 -> 视觉」的对应关系
+  rows.push({ t: '[ Sound Mapping ]', c: 'head' });
+  rows.push({ t: 'Clap  -> Orange / Stretch High', c: 'clap' });
+  rows.push({ t: 'Voice -> Purple / Expand Radius', c: 'voice' });
+  rows.push({ t: 'Tap   -> Green  / Sharp Spike', c: 'tap' });
+  rows.push({ t: 'Bg    -> Cool-Warm Gradient', c: 'dim' });
+  rows.push({ t: '' });
+  rows.push({ t: 'H hide / R reset / M mic', c: 'dim' });
 
   push();
   noStroke();
+
+  const lineH = 16;
+  const panelH = 30 + rows.length * lineH;
   fill(0, 0, 100, 82);
-  rect(16, 16, PANEL_W, 30 + lines.length * 16, 6);
-  fill(0, 0, 18);
-  textSize(12);
+  rect(16, 16, PANEL_W, panelH, 6);
+
   textFont('monospace');
-  text(lines.join('\n'), 30, 38);
+  textSize(12);
+
+  let y = 38;
+  for (const r of rows) {
+    if (r.t) {
+      textSize(r.sz || 12);          // 醒目行用大一号字
+      applyRowColor(r.c);
+      text(r.t, 30, y);
+    }
+    y += lineH;
+  }
 
   // 置信度条：直观看出离 0.85 还有多远
   const barX = 30;
   const barW = PANEL_W - 60;
-  const barY = 28 + lines.length * 16;
+  const barY = 28 + rows.length * lineH;
+  textSize(12);
   noFill();
   stroke(0, 0, 60, 70);
   rect(barX, barY, barW, 4, 2);
   noStroke();
-  fill(lastConfidence >= THRESHOLD ? 140 : 25, 70, 85);   // 达标=青绿，未达标=橙
+  fill(lastConfidence >= THRESHOLD ? 150 : 25, 75, 85);   // 达标=青绿，未达标=橙
   rect(barX, barY, barW * constrain(lastConfidence, 0, 1), 4, 2);
   // 阈值刻度线
   fill(0, 0, 30, 70);
@@ -321,12 +426,24 @@ function drawHUD() {
   pop();
 }
 
+// HUD 行配色（仍是 HSB 模式）
+function applyRowColor(c) {
+  if (c === 'alert')      fill(0, 95, 88);      // 红：需要用户操作
+  else if (c === 'ok')    fill(160, 85, 62);    // 墨绿：麦克风工作中
+  else if (c === 'head')  fill(0, 0, 30);       // 深灰：小标题
+  else if (c === 'dim')   fill(0, 0, 45);       // 浅灰：辅助信息
+  else if (c === 'clap')  fill(15, 90, 88);     // 橙：Clap
+  else if (c === 'voice') fill(280, 80, 72);    // 紫：Voice
+  else if (c === 'tap')   fill(140, 85, 62);    // 绿：Tap
+  else                    fill(0, 0, 18);       // 正文
+}
+
 function keyPressed() {
   const k = key.toLowerCase();
 
   if (k === 'h') showHUD = !showHUD;
   if (k === 'r') { RULES = { ...DEFAULTS }; soundTarget = null; soundClass = ''; buildGrid(); }
-  if (k === 'm') soundEnabled = !soundEnabled;
+  if (k === 'm') toggleMic();   // 手动开关麦克风
 
   if (keyCode === UP_ARROW)    RULES.radius = min(RULES.radius + 20, 900);
   if (keyCode === DOWN_ARROW)  RULES.radius = max(RULES.radius - 20, 40);
